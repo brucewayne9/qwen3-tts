@@ -56,6 +56,9 @@ default_ref_audio = None
 default_ref_text = "Some call me nature, others call me mother nature."
 default_voice_prompt = None
 
+# Cache for voice data: {voice_name: {"processed_audio": path, "ref_text": str, "prompt": object}}
+voice_cache = {}
+
 
 def convert_to_wav(input_path: str, output_path: str):
     """Convert any audio format to WAV using pydub."""
@@ -149,8 +152,25 @@ def apply_speed(audio_data: np.ndarray, sr: int, speed: float) -> np.ndarray:
         return audio_data
 
 
+def generate_speech_with_prompt(text: str, voice_prompt, speed: float = 1.0) -> tuple[np.ndarray, int]:
+    """Generate speech using cached voice clone prompt (optimized)."""
+    wavs, sr = model.generate_voice_clone(
+        text=text,
+        language="Auto",
+        voice_clone_prompt=voice_prompt,
+    )
+    
+    audio_data = wavs[0]
+    
+    # Apply speed adjustment if needed
+    if speed != 1.0:
+        audio_data = apply_speed(audio_data, sr, speed)
+    
+    return audio_data, sr
+
+
 def generate_speech(text: str, ref_audio_path: str, ref_text: str, speed: float = 1.0) -> tuple[np.ndarray, int]:
-    """Generate speech using Qwen3-TTS voice cloning."""
+    """Generate speech using Qwen3-TTS voice cloning (non-cached fallback)."""
     # Load reference audio as numpy array
     ref_audio_data, ref_sr = sf.read(ref_audio_path)
     
@@ -178,19 +198,41 @@ def audio_to_wav_bytes(audio_data: np.ndarray, sr: int) -> io.BytesIO:
     return buffer
 
 
-# Voice prompt cache for efficiency
-voice_prompts = {}
-
-
-def get_or_create_voice_prompt(voice: str, ref_audio_path: str, ref_text: str):
-    """Get cached voice prompt or create new one."""
-    if voice not in voice_prompts:
-        ref_audio_data, ref_sr = sf.read(ref_audio_path)
-        voice_prompts[voice] = model.create_voice_clone_prompt(
-            ref_audio=(ref_audio_data, ref_sr),
-            ref_text=ref_text,
-        )
-    return voice_prompts[voice]
+def get_or_create_voice_cache(voice: str, reference_file: str) -> dict:
+    """
+    Get cached voice data or create new cache entry.
+    Caches: processed audio path, transcription, and voice clone prompt.
+    This avoids repeated Whisper transcription on every request.
+    """
+    global voice_cache
+    
+    if voice in voice_cache:
+        logging.info(f"Using cached voice data for: {voice}")
+        return voice_cache[voice]
+    
+    logging.info(f"Creating voice cache for: {voice}")
+    
+    # Process reference audio (clip to 15s, remove silence)
+    processed_ref, ref_text = process_reference_audio(reference_file)
+    
+    # Create reusable voice clone prompt
+    ref_audio_data, ref_sr = sf.read(processed_ref)
+    voice_prompt = model.create_voice_clone_prompt(
+        ref_audio=(ref_audio_data, ref_sr),
+        ref_text=ref_text,
+    )
+    
+    # Store in cache
+    voice_cache[voice] = {
+        "processed_audio": processed_ref,
+        "ref_text": ref_text,
+        "prompt": voice_prompt,
+        "audio_data": ref_audio_data,
+        "sample_rate": ref_sr,
+    }
+    
+    logging.info(f"Voice cache created for: {voice} (transcription: '{ref_text[:50]}...')")
+    return voice_cache[voice]
 
 
 @app.on_event("startup")
@@ -263,11 +305,11 @@ async def change_voice(reference_speaker: str = Form(...), file: UploadFile = Fi
         text = transcribe_audio(input_path)
         logging.info(f'Transcribed input audio: {text}')
         
-        # Process reference audio
-        processed_ref, ref_text = process_reference_audio(reference_file)
+        # Get or create cached voice data for the reference speaker
+        cache_data = get_or_create_voice_cache(reference_speaker, reference_file)
         
-        # Generate with the new voice
-        audio_data, sr = generate_speech(text, processed_ref, ref_text)
+        # Generate with the new voice using cached prompt
+        audio_data, sr = generate_speech_with_prompt(text, cache_data["prompt"])
         
         # Save output
         save_path = f'{output_dir}/output_converted.wav'
@@ -312,9 +354,10 @@ async def upload_audio(audio_file_label: str = Form(...), file: UploadFile = Fil
         wav_path = f"{resources_dir}/{audio_file_label}.wav"
         convert_to_wav(f"{resources_dir}/{stored_file_name}", wav_path)
         
-        # Clear cached voice prompt if it exists
-        if audio_file_label in voice_prompts:
-            del voice_prompts[audio_file_label]
+        # Clear cached voice data if it exists (will be regenerated on next use)
+        if audio_file_label in voice_cache:
+            del voice_cache[audio_file_label]
+            logging.info(f"Cleared voice cache for: {audio_file_label}")
 
         return {"message": f"File {file.filename} uploaded successfully with label {audio_file_label}."}
     except Exception as e:
@@ -352,15 +395,15 @@ async def synthesize_speech(
         else:
             reference_file = f'{resources_dir}/{matching_files[0]}'
 
-        # Process reference audio and get transcription
+        # Get or create cached voice data (includes transcription and voice prompt)
         if voice == "default_en" and default_ref_audio:
-            ref_text = default_ref_text
-            processed_ref = default_ref_audio
+            # Use default voice with known transcription
+            cache_data = get_or_create_voice_cache(voice, default_ref_audio)
         else:
-            processed_ref, ref_text = process_reference_audio(reference_file)
+            cache_data = get_or_create_voice_cache(voice, reference_file)
         
-        # Generate speech
-        audio_data, sr = generate_speech(text, processed_ref, ref_text, speed)
+        # Generate speech using cached voice prompt (no re-transcription needed)
+        audio_data, sr = generate_speech_with_prompt(text, cache_data["prompt"], speed)
         
         # Save output
         save_path = f'{output_dir}/output_synthesized.wav'
