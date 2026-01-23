@@ -154,6 +154,9 @@ def apply_speed(audio_data: np.ndarray, sr: int, speed: float) -> np.ndarray:
 
 def generate_speech_with_prompt(text: str, voice_prompt, speed: float = 1.0) -> tuple[np.ndarray, int]:
     """Generate speech using cached voice clone prompt (optimized)."""
+    import time
+    start_time = time.time()
+    
     wavs, sr = model.generate_voice_clone(
         text=text,
         language="Auto",
@@ -166,11 +169,18 @@ def generate_speech_with_prompt(text: str, voice_prompt, speed: float = 1.0) -> 
     if speed != 1.0:
         audio_data = apply_speed(audio_data, sr, speed)
     
+    generation_time = time.time() - start_time
+    audio_duration = len(audio_data) / sr
+    logging.info(f"Generation completed in {generation_time:.2f}s (audio duration: {audio_duration:.2f}s, RTF: {generation_time/audio_duration:.2f}x)")
+    
     return audio_data, sr
 
 
 def generate_speech(text: str, ref_audio_path: str, ref_text: str, speed: float = 1.0) -> tuple[np.ndarray, int]:
     """Generate speech using Qwen3-TTS voice cloning (non-cached fallback)."""
+    import time
+    start_time = time.time()
+    
     # Load reference audio as numpy array
     ref_audio_data, ref_sr = sf.read(ref_audio_path)
     
@@ -186,6 +196,10 @@ def generate_speech(text: str, ref_audio_path: str, ref_text: str, speed: float 
     # Apply speed adjustment if needed
     if speed != 1.0:
         audio_data = apply_speed(audio_data, sr, speed)
+    
+    generation_time = time.time() - start_time
+    audio_duration = len(audio_data) / sr
+    logging.info(f"Generation completed in {generation_time:.2f}s (audio duration: {audio_duration:.2f}s, RTF: {generation_time/audio_duration:.2f}x)")
     
     return audio_data, sr
 
