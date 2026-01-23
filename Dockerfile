@@ -35,8 +35,8 @@ RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pyt
 COPY requirements.txt /tmp/
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Install flash-attention (optional, may fail on some systems)
-RUN pip install --no-cache-dir flash-attn --no-build-isolation || true
+# Install flash-attention from pre-built wheel (PyTorch 2.10 + CUDA 12.8 + Python 3.10)
+RUN pip install --no-cache-dir https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.12/flash_attn-2.6.3+cu128torch2.10-cp310-cp310-linux_x86_64.whl || true
 
 # Pre-download models to cache them in the image
 RUN python -c "from qwen_tts import Qwen3TTSModel; Qwen3TTSModel.from_pretrained('Qwen/Qwen3-TTS-12Hz-1.7B-Base')" || true
