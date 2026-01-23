@@ -79,9 +79,6 @@ COPY --from=builder /root/.cache /root/.cache
 
 ENV SHELL=/bin/bash
 ENV PYTHONUNBUFFERED=1
-# Set HuggingFace Hub to offline mode to skip file verification on startup
-# All models are pre-downloaded during build
-ENV HF_HUB_OFFLINE=1
 
 # Create necessary directories in /app (not /workspace which RunPod uses for network volumes)
 RUN mkdir -p /app/server/outputs /app/server/resources
