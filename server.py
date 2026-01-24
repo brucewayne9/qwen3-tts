@@ -157,6 +157,9 @@ def generate_speech_with_prompt(text: str, voice_prompt, speed: float = 1.0) -> 
     import time
     start_time = time.time()
     
+    # Set fixed seed for reproducible output
+    torch.manual_seed(42)
+    
     wavs, sr = model.generate_voice_clone(
         text=text,
         language="Auto",
@@ -180,6 +183,9 @@ def generate_speech(text: str, ref_audio_path: str, ref_text: str, speed: float 
     """Generate speech using Qwen3-TTS voice cloning (non-cached fallback)."""
     import time
     start_time = time.time()
+    
+    # Set fixed seed for reproducible output
+    torch.manual_seed(42)
     
     # Load reference audio as numpy array
     ref_audio_data, ref_sr = sf.read(ref_audio_path)
