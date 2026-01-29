@@ -1,0 +1,16 @@
+[Unit]
+Description=Qwen3-TTS Gradio UI
+After=network.target qwen3-tts.service
+Wants=qwen3-tts.service
+
+[Service]
+Type=simple
+User=aialfred
+WorkingDirectory=/home/aialfred/qwen3-tts
+Environment="PATH=/home/aialfred/qwen3-tts/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/aialfred/qwen3-tts/venv/bin/python gradio_app.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

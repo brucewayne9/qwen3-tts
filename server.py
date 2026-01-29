@@ -27,16 +27,74 @@ app.add_middleware(
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-# Initialize Qwen3-TTS model
+# Initialize Qwen3-TTS models with model swapping (GPU can't hold both)
 from qwen_tts import Qwen3TTSModel
+import gc
 
-logging.info(f"Loading Qwen3-TTS model on {device}...")
-model = Qwen3TTSModel.from_pretrained(
-    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-    device_map=device,
-    dtype=torch.bfloat16,
-)
-logging.info("Qwen3-TTS model loaded successfully")
+BASE_MODEL_NAME = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+VOICE_DESIGN_MODEL_NAME = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+
+# Track which model is currently loaded
+current_model_type = None  # "base" or "voice_design"
+model = None
+
+def unload_current_model():
+    """Unload the current model to free GPU memory."""
+    global model, current_model_type, voice_cache
+    if model is not None:
+        logging.info(f"Unloading {current_model_type} model to free GPU memory...")
+        del model
+        model = None
+        # Clear voice cache since prompts are tied to the model
+        voice_cache = {}
+        current_model_type = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        logging.info("GPU memory cleared")
+
+def get_base_model():
+    """Get the Base model (for voice cloning), loading if needed."""
+    global model, current_model_type
+    if current_model_type == "base" and model is not None:
+        return model
+
+    # Need to swap models
+    if current_model_type != "base":
+        unload_current_model()
+
+    logging.info(f"Loading Base model: {BASE_MODEL_NAME}...")
+    model = Qwen3TTSModel.from_pretrained(
+        BASE_MODEL_NAME,
+        device_map=device,
+        dtype=torch.bfloat16,
+    )
+    current_model_type = "base"
+    logging.info("Base model loaded successfully")
+    return model
+
+def get_voice_design_model():
+    """Get the VoiceDesign model (for voice descriptions), loading if needed."""
+    global model, current_model_type
+    if current_model_type == "voice_design" and model is not None:
+        return model
+
+    # Need to swap models
+    if current_model_type != "voice_design":
+        unload_current_model()
+
+    logging.info(f"Loading VoiceDesign model: {VOICE_DESIGN_MODEL_NAME}...")
+    model = Qwen3TTSModel.from_pretrained(
+        VOICE_DESIGN_MODEL_NAME,
+        device_map=device,
+        dtype=torch.bfloat16,
+    )
+    current_model_type = "voice_design"
+    logging.info("VoiceDesign model loaded successfully")
+    return model
+
+# Load Base model on startup
+logging.info(f"Loading initial Qwen3-TTS model on {device}...")
+model = get_base_model()
 
 # Initialize Whisper for transcription (Qwen3-TTS doesn't have built-in transcription)
 import whisper
@@ -156,11 +214,14 @@ def generate_speech_with_prompt(text: str, voice_prompt, speed: float = 1.0) -> 
     """Generate speech using cached voice clone prompt (optimized)."""
     import time
     start_time = time.time()
-    
+
     # Set fixed seed for reproducible output
     torch.manual_seed(42)
-    
-    wavs, sr = model.generate_voice_clone(
+
+    # Ensure Base model is loaded
+    base_model = get_base_model()
+
+    wavs, sr = base_model.generate_voice_clone(
         text=text,
         language="Auto",
         voice_clone_prompt=voice_prompt,
@@ -183,14 +244,17 @@ def generate_speech(text: str, ref_audio_path: str, ref_text: str, speed: float 
     """Generate speech using Qwen3-TTS voice cloning (non-cached fallback)."""
     import time
     start_time = time.time()
-    
+
     # Set fixed seed for reproducible output
     torch.manual_seed(42)
-    
+
+    # Ensure Base model is loaded
+    base_model = get_base_model()
+
     # Load reference audio as numpy array
     ref_audio_data, ref_sr = sf.read(ref_audio_path)
-    
-    wavs, sr = model.generate_voice_clone(
+
+    wavs, sr = base_model.generate_voice_clone(
         text=text,
         language="Auto",
         ref_audio=(ref_audio_data, ref_sr),
@@ -231,13 +295,16 @@ def get_or_create_voice_cache(voice: str, reference_file: str) -> dict:
         return voice_cache[voice]
     
     logging.info(f"Creating voice cache for: {voice}")
-    
+
     # Process reference audio (clip to 15s, remove silence)
     processed_ref, ref_text = process_reference_audio(reference_file)
-    
+
+    # Ensure Base model is loaded
+    base_model = get_base_model()
+
     # Create reusable voice clone prompt
     ref_audio_data, ref_sr = sf.read(processed_ref)
-    voice_prompt = model.create_voice_clone_prompt(
+    voice_prompt = base_model.create_voice_clone_prompt(
         ref_audio=(ref_audio_data, ref_sr),
         ref_text=ref_text,
     )
@@ -446,4 +513,181 @@ async def synthesize_speech(
         return result
     except Exception as e:
         logging.error(f"Error in synthesize_speech: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== Voice Design API ====================
+
+# Store designed voices: {name: {"description": str, "language": str}}
+import json
+DESIGNED_VOICES_FILE = f"{resources_dir}/designed_voices.json"
+
+def load_designed_voices() -> dict:
+    """Load designed voices from JSON file."""
+    if os.path.exists(DESIGNED_VOICES_FILE):
+        with open(DESIGNED_VOICES_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_designed_voices(voices: dict):
+    """Save designed voices to JSON file."""
+    with open(DESIGNED_VOICES_FILE, 'w') as f:
+        json.dump(voices, f, indent=2)
+
+
+@app.get("/voice_design/voices")
+async def list_designed_voices():
+    """List all designed voices."""
+    voices = load_designed_voices()
+    return {"voices": [{"name": k, **v} for k, v in voices.items()]}
+
+
+@app.post("/voice_design/create")
+async def create_designed_voice(
+    name: str = Form(...),
+    description: str = Form(...),
+    language: str = Form(default="English"),
+):
+    """
+    Create a new voice from a natural language description.
+
+    Example descriptions:
+    - "Male, 30 years old, deep voice, calm and professional tone"
+    - "Female, young, cheerful and energetic, slight British accent"
+    - "Elderly man, warm and wise, storyteller voice"
+    """
+    try:
+        # Validate name
+        name = name.strip().replace(" ", "_")
+        if not name:
+            raise HTTPException(status_code=400, detail="Voice name is required")
+
+        voices = load_designed_voices()
+        voices[name] = {
+            "description": description,
+            "language": language,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        save_designed_voices(voices)
+
+        logging.info(f"Created designed voice: {name} - {description}")
+        return {"message": f"Voice '{name}' created successfully", "voice": voices[name]}
+    except Exception as e:
+        logging.error(f"Error creating designed voice: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/voice_design/voices/{name}")
+async def delete_designed_voice(name: str):
+    """Delete a designed voice."""
+    voices = load_designed_voices()
+    if name not in voices:
+        raise HTTPException(status_code=404, detail=f"Voice '{name}' not found")
+
+    del voices[name]
+    save_designed_voices(voices)
+    return {"message": f"Voice '{name}' deleted"}
+
+
+@app.get("/voice_design/synthesize")
+async def synthesize_with_designed_voice(
+    text: str,
+    voice: str,
+    speed: Optional[float] = 1.0,
+):
+    """
+    Synthesize speech using a designed voice (from description).
+    """
+    start_time = time.time()
+    try:
+        voices = load_designed_voices()
+        if voice not in voices:
+            raise HTTPException(status_code=404, detail=f"Designed voice '{voice}' not found")
+
+        voice_data = voices[voice]
+        description = voice_data["description"]
+        language = voice_data.get("language", "English")
+
+        logging.info(f"Generating speech with designed voice: {voice} ({description})")
+
+        # Get VoiceDesign model (lazy-loaded)
+        vd_model = get_voice_design_model()
+
+        # Set fixed seed for reproducibility
+        torch.manual_seed(42)
+
+        # Generate with voice design
+        wavs, sr = vd_model.generate_voice_design(
+            text=text,
+            language=language,
+            instruct=description,
+        )
+
+        audio_data = wavs[0]
+
+        # Apply speed adjustment if needed
+        if speed != 1.0:
+            audio_data = apply_speed(audio_data, sr, speed)
+
+        # Save output
+        save_path = f'{output_dir}/output_voice_design.wav'
+        sf.write(save_path, audio_data, sr)
+
+        result = StreamingResponse(open(save_path, 'rb'), media_type="audio/wav")
+
+        elapsed_time = time.time() - start_time
+        result.headers["X-Elapsed-Time"] = str(elapsed_time)
+        result.headers["X-Device-Used"] = device
+        result.headers["Access-Control-Allow-Origin"] = "*"
+
+        logging.info(f"Voice design generation completed in {elapsed_time:.2f}s")
+        return result
+    except Exception as e:
+        logging.error(f"Error in voice design synthesis: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/voice_design/preview")
+async def preview_voice_design(
+    description: str,
+    language: str = "English",
+    text: str = "Hello, this is a preview of the designed voice.",
+):
+    """
+    Preview a voice design without saving it.
+    Use this to test descriptions before creating a named voice.
+    """
+    start_time = time.time()
+    try:
+        logging.info(f"Previewing voice design: {description}")
+
+        # Get VoiceDesign model (lazy-loaded)
+        vd_model = get_voice_design_model()
+
+        # Set fixed seed for reproducibility
+        torch.manual_seed(42)
+
+        # Generate with voice design
+        wavs, sr = vd_model.generate_voice_design(
+            text=text,
+            language=language,
+            instruct=description,
+        )
+
+        audio_data = wavs[0]
+
+        # Save output
+        save_path = f'{output_dir}/output_voice_design_preview.wav'
+        sf.write(save_path, audio_data, sr)
+
+        result = StreamingResponse(open(save_path, 'rb'), media_type="audio/wav")
+
+        elapsed_time = time.time() - start_time
+        result.headers["X-Elapsed-Time"] = str(elapsed_time)
+        result.headers["Access-Control-Allow-Origin"] = "*"
+
+        logging.info(f"Voice design preview completed in {elapsed_time:.2f}s")
+        return result
+    except Exception as e:
+        logging.error(f"Error in voice design preview: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
