@@ -5,7 +5,8 @@ import gradio as gr
 from pathlib import Path
 
 RESOURCES_DIR = Path("/home/aialfred/qwen3-tts/resources")
-API_URL = "http://localhost:7860"
+# Use environment variable or default to localhost
+API_URL = os.environ.get("QWEN_TTS_API_URL", "http://localhost:7860")
 
 
 def list_voices():
